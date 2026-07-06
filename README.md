@@ -88,5 +88,3 @@ All-in-one enterprise Redis data governance toolkit, integrates Redis backup, re
 
 ### Scenarios
 Live cluster migration, cross-region disaster backup, multi-datacenter active-active architecture, cache data archiving & rollback.
-
-需要我把这份文案压缩成 README 顶部**短摘要横幅版**（100字内，适合仓库首页第一眼展示）吗？
