@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package redis_syncer;
+
+// ApiService - Redis 同步器 gRPC 服务
+service ApiService {
+    // Sync - 同步数据流
+    // 
+    // Follower 调用此方法连接 Leader，接收同步数据流。
+    // Leader 通过 server streaming 发送数据。
+    rpc Sync (SyncRequest) returns (stream SyncResponse);
+}
+
+// SyncRequest - 同步请求
+// 
+// Follower 发送给 Leader 的请求信息。
+message SyncRequest {
+    // 节点 ID
+    string node_id = 1;
+    
+    // 节点地址
+    string address = 2;
+    
+    // 当前 offset
+    int64 offset = 3;
+    
+    // 当前 runId
+    string run_id = 4;
+}
+
+// SyncResponse - 同步响应
+//
+// Leader 发送给 Follower 的数据流消息。
+message SyncResponse {
+    // 响应码
+    ResponseCode code = 1;
+    
+    // Meta 信息（仅在 META 时有效）
+    SyncMeta meta = 2;
+    
+    // 数据 offset
+    int64 offset = 3;
+    
+    // 数据大小
+    int64 size = 4;
+    
+    // 数据内容
+    bytes data = 5;
+}
+
+// ResponseCode - 响应码
+enum ResponseCode {
+    // 未知
+    UNKNOWN = 0;
+    
+    // 元数据信息
+    META = 1;
+    
+    // 继续传输
+    CONTINUE = 2;
+    
+    // 交接
+    HANDOVER = 3;
+    
+    // 清理
+    CLEAR = 4;
+    
+    // 故障
+    FAULT = 5;
+    
+    // 错误
+    ERROR = 6;
+    
+    // 失败
+    FAILURE = 7;
+}
+
+// SyncMeta - 同步元数据
+message SyncMeta {
+    // runId
+    string run_id = 1;
+    
+    // 消息内容
+    string msg = 2;
+    
+    // 是否为 AOF
+    bool aof = 3;
+}

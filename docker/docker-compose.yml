@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  redis-ha-tool:
+    image: redis-ha-tool:0.1.0
+    container_name: redis-ha-tool
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 可选：源 Redis
+  redis-source:
+    image: redis:7.0
+    container_name: redis-source
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-source-data:/data
+
+  # 可选：目标 Redis
+  redis-target:
+    image: redis:7.0
+    container_name: redis-target
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-target-data:/data
+
+volumes:
+  redis-source-data:
+  redis-target-data:
