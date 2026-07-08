@@ -29,6 +29,11 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
         }
     }
     
+    /// 获取解析出的 RDB 版本号
+    pub fn rdb_version(&self) -> u32 {
+        self.state.version
+    }
+
     /// 解析 RDB 文件
     ///
     /// 通过回调函数发送每个解析出的 BinEntry。
