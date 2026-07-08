@@ -1,0 +1,79 @@
+{
+  "license": {
+    "key": ""
+  },
+  "server": {
+    "http_port": 8080,
+    "grpc_port": 9090
+  },
+  "cluster": {
+    "enabled": false,
+    "node_id": "",
+    "election_backend": "redis"
+  },
+  "input": {
+    "addresses": [
+      "127.0.0.1:5000"
+    ],
+    "password": "",
+    "auth_type": "none",
+    "redis_type": "standalone",
+    "tls": {
+      "enabled": false,
+      "ca_cert": "",
+      "client_cert": "",
+      "client_key": ""
+    },
+    "keepalive": {
+      "interval": 10
+    },
+    "replay": {
+      "resume_from_break_point": false,
+      "key_exists": "none",
+      "rdb_parallel": 4,
+      "pipeline": false,
+      "transaction": false,
+      "batch_size": 65536,
+      "batch_count": 100
+    },
+    "filter": {
+      "db_black_list": [],
+      "cmd_black_list": ["PING"],
+      "key_prefix_white_list": [],
+      "key_prefix_black_list": [],
+      "slot_white_list": [],
+      "slot_black_list": []
+    }
+  },
+  "output": {
+    "addresses": [
+      "127.0.0.1:6000"
+    ],
+    "password": "",
+    "auth_type": "none",
+    "redis_type": "standalone",
+    "tls": {
+      "enabled": false,
+      "ca_cert": "",
+      "client_cert": "",
+      "client_key": ""
+    },
+    "keepalive": {
+      "interval": 10
+    }
+  },
+  "local_cache": {
+    "dir": "cache",
+    "max_size": 1073741824,
+    "log_size": 104857600,
+    "header_size": 16
+  },
+  "log": {
+    "level": "info",
+    "dir": "logs",
+    "max_age": 7,
+    "max_files": 10,
+    "max_size": 104857600,
+    "stdout": true
+  }
+}

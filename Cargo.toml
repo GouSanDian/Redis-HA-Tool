@@ -1,0 +1,76 @@
+[package]
+name = "redis-ha-tool"
+version = "0.1.0"
+edition = "2021"
+authors = ["Redis Syncer Team"]
+description = "高性能 Redis 数据同步工具"
+license = "MIT"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# Web 框架
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# gRPC
+tonic = "0.11"
+prost = "0.12"
+
+# Redis
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager", "cluster-async"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# 监控
+prometheus-client = "0.22"
+
+# 错误处理
+thiserror = "1"
+anyhow = "1"
+
+# 工具
+bytes = "1"
+md-5 = "0.10"
+fnv = "1"
+chrono = "0.4"
+
+# etcd（可选）
+etcd-client = { version = "0.12", optional = true }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# URL 处理
+url = "2"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+etcd = ["etcd-client"]
+
+[[bin]]
+name = "redis-ha-tool"
+path = "src/main.rs"
+
+[lib]
+name = "redis_syncer"
+path = "src/lib.rs"
