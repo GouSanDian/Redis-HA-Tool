@@ -54,6 +54,8 @@ impl RedisOutput {
     }
 
     async fn send_rdb_data(&self, stream: &mut TcpStream, reader: &mut Box<dyn Reader>) -> Result<i64> {
+        // 默认 RDB 版本号（当无法从解析中获取时使用）
+        let default_version: u16 = 9;
         tracing::debug!("解析 RDB 数据并发送 RESTORE 命令到目标 Redis");
 
         // 获取 RDB 总大小
@@ -89,6 +91,14 @@ impl RedisOutput {
             Ok(())
         }).await;
 
+        // 获取 RDB 版本号（用于 DUMP payload）
+        let rdb_version = if parser.rdb_version() > 0 {
+            parser.rdb_version() as u16
+        } else {
+            default_version
+        };
+        tracing::debug!("使用 RDB version {} 生成 DUMP payload", rdb_version);
+
         if let Err(e) = result {
             tracing::error!("RDB 解析失败: {}", e);
             // 即使解析失败，也要返回原始字节数，以便 offset 能正确推进
@@ -118,7 +128,7 @@ impl RedisOutput {
             }
 
             // 发送 RESTORE 命令
-            self.send_restore_command(stream, &entry).await?;
+            self.send_restore_command(stream, &entry, rdb_version).await?;
             sent_keys += 1;
         }
 
@@ -131,11 +141,11 @@ impl RedisOutput {
     ///
     /// 使用 DUMP 格式序列化数据，通过 RESTORE 命令恢复
     /// 支持所有数据类型（String, List, Set, Hash, ZSet 等）
-    async fn send_restore_command(&self, stream: &mut TcpStream, entry: &BinEntry) -> Result<()> {
+    async fn send_restore_command(&self, stream: &mut TcpStream, entry: &BinEntry, rdb_version: u16) -> Result<()> {
         let key = String::from_utf8_lossy(&entry.key);
 
         // 生成 DUMP 格式的序列化数据
-        let dump_payload = match crate::protocol::rdb::generate_dump_payload(entry) {
+        let dump_payload = match crate::protocol::rdb::generate_dump_payload(entry, rdb_version) {
             Some(payload) => payload,
             None => {
                 tracing::warn!("无法生成 DUMP payload for key '{}': 缺少原始 RDB 数据", key);
