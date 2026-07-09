@@ -134,7 +134,7 @@ impl RedisInput {
         self.initial_master_offset = offset;
     }
 
-    /// 发送 PSYNC 命令（替代旧的 SYNC 命令）
+    /// 发送 PSYNC 命令
     ///
     /// PSYNC 格式: `PSYNC <runid> <offset>`
     /// - 从 checkpoint 获取到 master_replid + offset 时发送 `PSYNC <replid> <offset>`
@@ -199,14 +199,13 @@ impl RedisInput {
             // RDB 使用 master_offset 作为本地文件的全局 offset，
             // 这样转发任务用 master offset 查找时可以命中 RDB 文件。
             let master_offset = self.psync_offset.load(Ordering::Relaxed);
-            let rdb_size = self.receive_rdb_data(buf_reader, master_offset).await?;
+            self.receive_rdb_data(buf_reader, master_offset).await?;
 
             // AOF 紧跟 RDB 之后，全局 offset = master_offset + rdb_size。
             // 这样转发任务处理完 RDB 后 offset 推进到这里，能正确命中 AOF 文件。
-            let aof_start_offset = master_offset + rdb_size;
+            let aof_start_offset = master_offset;
             tracing::info!(
-                "AOF 起始全局 offset: {} (master_offset={} + rdb_size={})",
-                aof_start_offset, master_offset, rdb_size
+                "AOF 起始全局 offset: {}", aof_start_offset
             );
 
             // RDB 同步完成后，发送 REPLCONF ACK 通知主节点
@@ -242,8 +241,8 @@ impl RedisInput {
         Ok(())
     }
 
-    async fn receive_rdb_data(&self, buf_reader: &mut BufReader<TcpStream>, rdb_offset: i64) -> Result<i64> {
-        tracing::debug!("读取 FULLRESYNC RDB 响应（全局 offset={}）", rdb_offset);
+    async fn receive_rdb_data(&self, buf_reader: &mut BufReader<TcpStream>, master_offset: i64) -> Result<i64> {
+        tracing::debug!("读取 FULLRESYNC RDB 响应（全局 master_offset={}）", master_offset);
 
         let mut line = String::new();
         buf_reader.read_line(&mut line).await?;
@@ -267,7 +266,7 @@ impl RedisInput {
 
         // RDB 文件使用 master_offset 作为全局 offset，
         // 这样转发任务用 psync_offset（= master_offset）查找时可以命中。
-        let mut rdb_writer = self.channel.get_rdb_writer(&self.run_id, rdb_offset, rdb_size).await?;
+        let mut rdb_writer = self.channel.get_rdb_writer(&self.run_id, master_offset - rdb_size, rdb_size).await?;
 
         tracing::debug!("开始接收 RDB 数据");
 

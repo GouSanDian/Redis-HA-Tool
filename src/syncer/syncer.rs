@@ -367,11 +367,21 @@ impl SyncerImpl {
                                                     if let Some(ref cm) = checkpoint_manager {
                                                         let replid = psync_master_replid.lock().unwrap().clone();
                                                         if !replid.is_empty() {
-                                                            if let Err(e) = cm.update_offset(&replid, offset).await {
-                                                                tracing::warn!("保存 AOF checkpoint 失败: {}", e);
+                                                            let checkpoint = CheckpointInfo::new(
+                                                                replid.clone(),
+                                                                offset,
+                                                            );
+                                                            if let Err(e) = cm.save_checkpoint(&checkpoint).await {
+                                                                tracing::warn!("保存 RDB checkpoint 失败: {}", e);
                                                             } else {
                                                                 tracing::debug!("保存 AOF checkpoint 成功: offset={}", offset);
                                                             }
+
+                                                            // if let Err(e) = cm.update_offset(&replid, offset).await {
+                                                            //     tracing::warn!("保存 AOF checkpoint 失败: {}", e);
+                                                            // } else {
+                                                            //     tracing::debug!("保存 AOF checkpoint 成功: offset={}", offset);
+                                                            // }
                                                         }
                                                     }
                                                     last_checkpoint_time = Instant::now();
