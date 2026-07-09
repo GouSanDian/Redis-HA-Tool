@@ -53,65 +53,72 @@ pub enum RdbOpcode {
 /// RDB 数据类型
 ///
 /// 定义 Redis 支持的各种数据类型编码。
+/// 参考：Redis 官方 RDB 格式定义
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RdbType {
     /// String（字符串）
     String = 0,
     
-    /// List（列表）
+    /// List（列表，旧格式）
     List = 1,
     
     /// Set（集合）
     Set = 2,
     
-    /// Sorted Set（有序集合）
+    /// Sorted Set / ZSet（有序集合，旧格式）
     SortedSet = 3,
     
-    /// Hash（哈希）
+    /// Hash（哈希表）
     Hash = 4,
     
-    /// Zipmap（压缩哈希）
-    Zipmap = 5,
+    /// Sorted Set 2 / ZSet2（有序集合，新格式）
+    SortedSet2 = 5,
     
-    /// Ziplist（压缩列表）
-    Ziplist = 6,
+    /// Hash Zipmap（压缩 Map 格式，已废弃）
+    HashZipmap = 9,
     
-    /// Intset（整数集合）
-    Intset = 7,
+    /// List Ziplist（Ziplist 编码的列表）
+    ListZiplist = 10,
     
-    /// Sorted Set in Ziplist（压缩有序集合）
-    SortedSetZiplist = 8,
+    /// Set Intset（整数集合编码的 Set）
+    SetIntset = 11,
     
-    /// Hashmap as Ziplist（压缩哈希）
-    HashmapZiplist = 9,
+    /// Sorted Set Ziplist（Ziplist 编码的有序集合）
+    SortedSetZiplist = 12,
     
-    /// Listpack（Redis 7+）
-    Listpack = 10,
+    /// Hash Ziplist（Ziplist 编码的哈希表）
+    HashZiplist = 13,
     
-    /// Hash as Listpack（Redis 7+）
-    HashListpack = 11,
+    /// Quicklist（Quicklist 编码的列表，Redis 4.0+）
+    Quicklist = 14,
     
-    /// Sorted Set as Listpack（Redis 7+）
-    SortedSetListpack = 12,
+    /// Stream Listpacks（Stream 类型，Redis 5.0+）
+    StreamListpacks = 15,
     
-    /// Stream as Listpack（Redis 7+）
-    StreamListpack = 13,
+    /// Hash Listpack（Listpack 编码的哈希表，Redis 7.0+）
+    HashListpack = 16,
     
-    /// Module（模块数据）
-    Module = 14,
+    /// Sorted Set Listpack（Listpack 编码的有序集合，Redis 7.0+）
+    SortedSetListpack = 17,
     
-    /// Module 2（模块数据）
-    Module2 = 15,
+    /// Quicklist2（Quicklist2 格式，Redis 7.0+）
+    Quicklist2 = 18,
     
-    /// Stream as Listpack 2（Redis 7+）
-    StreamListpack2 = 16,
+    /// Stream Listpacks 2（Stream 类型 v2，Redis 7.0+）
+    StreamListpacks2 = 19,
     
-    /// Set as Listpack（Redis 7+）
-    SetListpack = 17,
+    /// Set Listpack（Listpack 编码的集合，Redis 7.0+）
+    SetListpack = 20,
     
-    /// Function（Redis 7+）
-    Function2 = 18,
+    /// Stream Listpacks 3（Stream 类型 v3，Redis 7.2+）
+    StreamListpacks3 = 21,
+    
+    /// Module（模块数据，旧版本）
+    Module = 6,
+    
+    /// Module 2（模块数据，Redis 5.0+）
+    Module2 = 22,
 }
 
 impl RdbType {
@@ -123,20 +130,22 @@ impl RdbType {
             2 => Some(RdbType::Set),
             3 => Some(RdbType::SortedSet),
             4 => Some(RdbType::Hash),
-            5 => Some(RdbType::Zipmap),
-            6 => Some(RdbType::Ziplist),
-            7 => Some(RdbType::Intset),
-            8 => Some(RdbType::SortedSetZiplist),
-            9 => Some(RdbType::HashmapZiplist),
-            10 => Some(RdbType::Listpack),
-            11 => Some(RdbType::HashListpack),
-            12 => Some(RdbType::SortedSetListpack),
-            13 => Some(RdbType::StreamListpack),
-            14 => Some(RdbType::Module),
-            15 => Some(RdbType::Module2),
-            16 => Some(RdbType::StreamListpack2),
-            17 => Some(RdbType::SetListpack),
-            18 => Some(RdbType::Function2),
+            5 => Some(RdbType::SortedSet2),
+            6 => Some(RdbType::Module),
+            9 => Some(RdbType::HashZipmap),
+            10 => Some(RdbType::ListZiplist),
+            11 => Some(RdbType::SetIntset),
+            12 => Some(RdbType::SortedSetZiplist),
+            13 => Some(RdbType::HashZiplist),
+            14 => Some(RdbType::Quicklist),
+            15 => Some(RdbType::StreamListpacks),
+            16 => Some(RdbType::HashListpack),
+            17 => Some(RdbType::SortedSetListpack),
+            18 => Some(RdbType::Quicklist2),
+            19 => Some(RdbType::StreamListpacks2),
+            20 => Some(RdbType::SetListpack),
+            21 => Some(RdbType::StreamListpacks3),
+            22 => Some(RdbType::Module2),
             _ => None,
         }
     }
@@ -148,18 +157,19 @@ impl RdbType {
     
     /// 是否为列表类型
     pub fn is_list(&self) -> bool {
-        matches!(self, RdbType::List | RdbType::Ziplist | RdbType::Listpack)
+        matches!(self, RdbType::List | RdbType::ListZiplist | RdbType::Quicklist | RdbType::Quicklist2)
     }
     
     /// 是否为集合类型
     pub fn is_set(&self) -> bool {
-        matches!(self, RdbType::Set | RdbType::Intset | RdbType::SetListpack)
+        matches!(self, RdbType::Set | RdbType::SetIntset | RdbType::SetListpack)
     }
     
     /// 是否为有序集合类型
     pub fn is_sorted_set(&self) -> bool {
         matches!(self, 
             RdbType::SortedSet | 
+            RdbType::SortedSet2 |
             RdbType::SortedSetZiplist | 
             RdbType::SortedSetListpack
         )
@@ -169,8 +179,8 @@ impl RdbType {
     pub fn is_hash(&self) -> bool {
         matches!(self, 
             RdbType::Hash | 
-            RdbType::Zipmap | 
-            RdbType::HashmapZiplist | 
+            RdbType::HashZipmap | 
+            RdbType::HashZiplist | 
             RdbType::HashListpack
         )
     }
@@ -178,15 +188,15 @@ impl RdbType {
     /// 是否为压缩编码
     pub fn is_compressed(&self) -> bool {
         matches!(self,
-            RdbType::Zipmap |
-            RdbType::Ziplist |
-            RdbType::Intset |
+            RdbType::HashZipmap |
+            RdbType::ListZiplist |
+            RdbType::SetIntset |
             RdbType::SortedSetZiplist |
-            RdbType::HashmapZiplist |
-            RdbType::Listpack |
+            RdbType::HashZiplist |
+            RdbType::Quicklist |
             RdbType::HashListpack |
             RdbType::SortedSetListpack |
-            RdbType::StreamListpack |
+            RdbType::Quicklist2 |
             RdbType::SetListpack
         )
     }
@@ -339,7 +349,7 @@ mod tests {
         assert!(hash_type.is_hash());
         assert!(!hash_type.is_compressed());
         
-        let ziplist_type = RdbType::Ziplist;
+        let ziplist_type = RdbType::ListZiplist;
         assert!(ziplist_type.is_list());
         assert!(ziplist_type.is_compressed());
     }
