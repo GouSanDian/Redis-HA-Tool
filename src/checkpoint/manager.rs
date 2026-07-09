@@ -372,7 +372,7 @@ impl CheckpointManager {
         );
 
         // 1. 检查 checkpoint 是否存在
-        let exists: bool = redis::cmd("HGET")
+        let exists: bool = redis::cmd("HEXISTS")
             .arg(CHECKPOINT_KEY_HASH_KEY)
             .arg(master_replid)
             .query_async(&mut conn)
