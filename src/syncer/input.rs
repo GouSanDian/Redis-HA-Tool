@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
@@ -208,6 +209,12 @@ impl RedisInput {
                 aof_start_offset, master_offset, rdb_size
             );
 
+            // RDB 同步完成后，发送 REPLCONF ACK 通知主节点
+            // 获取 BufReader 底层的 TcpStream 来发送 ACK
+            let stream = buf_reader.get_mut();
+            self.send_replconf_ack(stream, aof_start_offset).await?;
+            tracing::info!("RDB 同步完成后发送 REPLCONF ACK: offset={}", aof_start_offset);
+
             // RDB 已落盘、AOF writer 即将创建，此时再通知转发任务开始，
             // 避免转发任务在数据文件就绪前空转。
             self.psync_ready.notify_waiters();
@@ -289,6 +296,19 @@ impl RedisInput {
         Ok(rdb_size)
     }
 
+    /// 发送 REPLCONF ACK 命令到主节点
+    ///
+    /// 这是 Redis 主从复制的心跳机制，从节点必须定期向主节点汇报
+    /// 已处理的复制偏移量，否则主节点会在 repl-timeout 后断开连接。
+    async fn send_replconf_ack(&self, stream: &mut TcpStream, offset: i64) -> Result<()> {
+        let offset_str = offset.to_string();
+        let ack_cmd = encode_command_str("REPLCONF", &["ACK", &offset_str]);
+        stream.write_all(&ack_cmd).await?;
+        stream.flush().await?;
+        tracing::debug!("发送 REPLCONF ACK: offset={}", offset);
+        Ok(())
+    }
+
     async fn receive_aof_stream(&self, buf_reader: &mut BufReader<TcpStream>, initial_offset: i64) -> Result<()> {
         tracing::debug!("开始接收 AOF 命令流（起始 offset: {}）", initial_offset);
 
@@ -296,28 +316,62 @@ impl RedisInput {
         let mut buf = vec![0u8; 8192];
         let mut received = 0i64;
 
-        loop {
-            let n = buf_reader.read(&mut buf).await?;
+        // 记录上次发送 ACK 的时间
+        let mut last_ack_time = std::time::Instant::now();
+        // ACK 间隔：每 10 秒发送一次，确保在默认 repl-timeout（60秒）内有多次 ACK
+        let ack_interval = Duration::from_secs(10);
 
-            if n == 0 {
-                tracing::info!("AOF 流结束");
-                break;
+        loop {
+            // 检查是否需要发送 REPLCONF ACK
+            let now = std::time::Instant::now();
+            if now.duration_since(last_ack_time) >= ack_interval {
+                // 获取 BufReader 底层的 TcpStream 来发送 ACK
+                let stream = buf_reader.get_mut();
+                let current_offset = initial_offset + received;
+                if let Err(e) = self.send_replconf_ack(stream, current_offset).await {
+                    tracing::warn!("发送 REPLCONF ACK 失败: {}，继续接收 AOF 流", e);
+                } else {
+                    tracing::debug!("定时发送 REPLCONF ACK: offset={}", current_offset);
+                }
+                last_ack_time = now;
             }
 
-            aof_writer.write_all(&buf[..n]).await?;
-            // 每次写入后立即 flush，确保数据落盘并通知转发任务
-            aof_writer.flush().await?;
-            received += n as i64;
+            // 使用 tokio::time::timeout 来设置读取超时，这样可以在没有数据时定期检查 ACK
+            let read_result = tokio::time::timeout(Duration::from_secs(1), buf_reader.read(&mut buf)).await;
 
-            if received % (1024 * 1024) == 0 {
-                tracing::debug!("AOF 接收进度: {} 字节", received);
+            match read_result {
+                Ok(Ok(n)) => {
+                    if n == 0 {
+                        return Err(SyncError::Protocol(format!(
+                            "AOF 流连接断开（对端关闭），已接收 {} 字节", received
+                        )));
+                    }
+
+                    aof_writer.write_all(&buf[..n]).await?;
+                    // 每次写入后立即 flush，确保数据落盘并通知转发任务
+                    aof_writer.flush().await?;
+                    received += n as i64;
+
+                    // 更新共享的 psync_offset，供 checkpoint 使用
+                    let current_offset = initial_offset + received;
+                    self.psync_offset.store(current_offset, Ordering::Relaxed);
+
+                    if received % (1024 * 1024) == 0 {
+                        tracing::debug!("AOF 接收进度: {} 字节, 当前 offset: {}", received, current_offset);
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(SyncError::Protocol(format!(
+                        "AOF 流读取异常: {}（已接收 {} 字节）", e, received
+                    )));
+                }
+                Err(_) => {
+                    // 读取超时，继续循环，这会触发上面的 ACK 检查
+                    tracing::trace!("AOF 读取超时，检查是否需要发送 ACK");
+                    continue;
+                }
             }
         }
-
-        aof_writer.flush().await?;
-        tracing::info!("AOF 流接收完成: {} 字节", received);
-
-        Ok(())
     }
 }
 

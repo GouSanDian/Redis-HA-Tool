@@ -61,6 +61,31 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
             let opcode = self.read_byte().await?;
             
             match opcode {
+                0xF7 => { // ModuleAux
+                    // 跳过 ModuleAux 数据
+                    // ModuleAux 结构: module_id (length encoded) + module data (complex structure)
+                    // 参考 Go 代码 rdbLoadCheckModuleValue
+                    let _module_id = self.read_length().await?;
+                    // 跳过模块数据
+                    if let Err(e) = self.skip_module_value().await {
+                        tracing::warn!("跳过 ModuleAux 数据失败: {}", e);
+                        return Err(e);
+                    }
+                    tracing::debug!("跳过 ModuleAux 数据");
+                }
+
+                0xF8 => { // Idle
+                    let _idle = self.read_length().await?;
+                    // Idle time 是键的空辅助信息，不影响数据解析
+                    tracing::debug!("跳过 Idle 数据");
+                }
+
+                0xF9 => { // Freq
+                    let _freq = self.read_byte().await?;
+                    // Freq 是键的辅助信息，不影响数据解析
+                    tracing::debug!("跳过 Freq 数据");
+                }
+
                 0xFA => { // AUX
                     let aux = self.read_aux_field().await?;
                     // 处理特定的 AUX 字段
@@ -136,8 +161,15 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                 _ => {
                     // 尝试解析为数据类型
                     if let Some(rdb_type) = RdbType::from_byte(opcode) {
-                        let entry = self.read_key_value(rdb_type).await?;
-                        callback(entry)?;
+                        // 对于 Module 类型，读取并跳过，不生成 BinEntry
+                        if matches!(rdb_type, RdbType::Module | RdbType::Module2) {
+                            let _entry = self.read_key_value(rdb_type).await?;
+                            // Module 数据暂不支持，直接跳过
+                            tracing::debug!("跳过 Module 类型数据");
+                        } else {
+                            let entry = self.read_key_value(rdb_type).await?;
+                            callback(entry)?;
+                        }
                     } else {
                         // 未知的 opcode
                         tracing::warn!("未知的 RDB opcode: {}", opcode);
@@ -198,9 +230,21 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                 let second_byte = self.read_byte().await?;
                 Ok(((first_byte as usize & 0x3F) << 8) | second_byte as usize)
             }
-            2 => { // 32 bit length
-                let length = self.read_u32().await?;
-                Ok(length as usize)
+            2 => { // 32 bit length 或特殊编码
+                // 检查是否是 rdb32bitLen (0x80) 或 rdb64bitLen (0x81)
+                match first_byte {
+                    0x80 => { // rdb32bitLen: 32 bit length (big endian)
+                        let length = self.read_u32_be().await?;
+                        Ok(length as usize)
+                    }
+                    0x81 => { // rdb64bitLen: 64 bit length (big endian)
+                        let length = self.read_u64_be().await?;
+                        Ok(length as usize)
+                    }
+                    _ => { // 特殊编码 - 这不是一个纯长度值
+                        Err(SyncError::Corrupted(format!("Special encoding encountered: {}", first_byte)))
+                    }
+                }
             }
             3 => { // Special encoding - this is NOT a length, it's an encoded integer
                 // Return the special encoding indicator
@@ -214,6 +258,14 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
     /// 读取长度编码值，处理特殊编码
     ///
     /// 返回 (长度, 是否是特殊编码, 编码值)
+    ///
+    /// 编码格式（参考 Redis rdb.c rdbLoadLen）：
+    /// - 前 2 bit = 00: 6 bit length
+    /// - 前 2 bit = 01: 14 bit length
+    /// - 前 2 bit = 10: 特殊处理
+    ///   - 整个字节 = 0x80 (rdb32bitLen): 32 bit length (big endian)
+    ///   - 整个字节 = 0x81 (rdb64bitLen): 64 bit length (big endian)
+    ///   - 其他: 特殊编码（前 2 bit = 11），后 6 bit 为编码类型
     async fn read_length_with_encoding(&mut self) -> Result<(usize, bool, u64)> {
         let first_byte = self.read_byte().await?;
 
@@ -228,19 +280,104 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                 let len = ((first_byte as usize & 0x3F) << 8) | second_byte as usize;
                 Ok((len, false, 0))
             }
-            2 => { // 32 bit length
-                let length = self.read_u32().await?;
-                Ok((length as usize, false, 0))
+            2 => { // 32 bit length 或特殊编码
+                // 检查是否是 rdb32bitLen (0x80) 或 rdb64bitLen (0x81)
+                match first_byte {
+                    0x80 => { // rdb32bitLen: 32 bit length (big endian)
+                        let length = self.read_u32_be().await?;
+                        Ok((length as usize, false, 0))
+                    }
+                    0x81 => { // rdb64bitLen: 64 bit length (big endian)
+                        let length = self.read_u64_be().await?;
+                        Ok((length as usize, false, 0))
+                    }
+                    _ => { // 特殊编码 (前 2 bit = 11)
+                        let encoding = first_byte & 0x3F;
+                        let value = match encoding {
+                            0 => self.read_byte().await? as u64, // 8 bit integer
+                            1 => self.read_u16().await? as u64,  // 16 bit integer
+                            2 => self.read_u32().await? as u64,  // 32 bit integer (little endian)
+                            _ => return Err(SyncError::Corrupted(format!("未知的特殊编码类型: {}", encoding))),
+                        };
+                        Ok((0, true, value))
+                    }
+                }
             }
-            3 => { // Special encoding
+            3 => { // Special encoding (前 2 bit = 11)
                 let encoding = first_byte & 0x3F;
                 let value = match encoding {
                     0 => self.read_byte().await? as u64, // 8 bit integer
                     1 => self.read_u16().await? as u64,  // 16 bit integer
-                    2 => self.read_u32().await? as u64,  // 32 bit integer
+                    2 => self.read_u32().await? as u64,  // 32 bit integer (little endian)
                     _ => return Err(SyncError::Corrupted(format!("未知的特殊编码类型: {}", encoding))),
                 };
                 Ok((0, true, value))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// 读取长度编码值，同时返回原始编码字节
+    ///
+    /// 返回 (长度值, 原始编码字节)
+    /// 原始字节可直接用于构建 RESTORE payload。
+    async fn read_length_with_raw(&mut self) -> Result<(usize, Bytes)> {
+        let first_byte = self.read_byte().await?;
+        let length_type = first_byte >> 6;
+        let mut raw = BytesMut::new();
+        raw.extend_from_slice(&[first_byte]);
+
+        match length_type {
+            0 => { // 6 bit length
+                Ok((first_byte as usize & 0x3F, raw.freeze()))
+            }
+            1 => { // 14 bit length
+                let second_byte = self.read_byte().await?;
+                raw.extend_from_slice(&[second_byte]);
+                let len = ((first_byte as usize & 0x3F) << 8) | second_byte as usize;
+                Ok((len, raw.freeze()))
+            }
+            2 => { // 32/64 bit length
+                match first_byte {
+                    0x80 => { // rdb32bitLen
+                        let len = self.read_u32_be().await?;
+                        raw.extend_from_slice(&len.to_be_bytes());
+                        Ok((len as usize, raw.freeze()))
+                    }
+                    0x81 => { // rdb64bitLen
+                        let len = self.read_u64_be().await?;
+                        raw.extend_from_slice(&len.to_be_bytes());
+                        Ok((len as usize, raw.freeze()))
+                    }
+                    _ => Err(SyncError::Corrupted(format!(
+                        "read_length_with_raw: 非法的长度编码字节: {:#x}",
+                        first_byte
+                    ))),
+                }
+            }
+            3 => { // Special encoding: 8/16/32 bit integer
+                let encoding = first_byte & 0x3F;
+                match encoding {
+                    0 => {
+                        let b = self.read_byte().await?;
+                        raw.extend_from_slice(&[b]);
+                        Ok((b as usize, raw.freeze()))
+                    }
+                    1 => {
+                        let v = self.read_u16().await?;
+                        raw.extend_from_slice(&v.to_le_bytes());
+                        Ok((v as usize, raw.freeze()))
+                    }
+                    2 => {
+                        let v = self.read_u32().await?;
+                        raw.extend_from_slice(&v.to_le_bytes());
+                        Ok((v as usize, raw.freeze()))
+                    }
+                    _ => Err(SyncError::Corrupted(format!(
+                        "read_length_with_raw: 未知的特殊编码类型: {}",
+                        encoding
+                    ))),
+                }
             }
             _ => unreachable!(),
         }
@@ -268,11 +405,23 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                 let len = ((first_byte as usize & 0x3F) << 8) | second_byte as usize;
                 self.read_string_raw(len).await
             }
-            2 => { // 32 bit length
-                let len = self.read_u32().await? as usize;
-                self.read_string_raw(len).await
+            2 => { // 32 bit 或 64 bit 长度 (big endian)
+                match first_byte {
+                    0x80 => { // rdb32bitLen: 32 bit big endian
+                        let len = self.read_u32_be().await? as usize;
+                        self.read_string_raw(len).await
+                    }
+                    0x81 => { // rdb64bitLen: 64 bit big endian
+                        let len = self.read_u64_be().await? as usize;
+                        self.read_string_raw(len).await
+                    }
+                    _ => Err(SyncError::Corrupted(format!(
+                        "read_string: 非法的长度编码字节: {:#x}",
+                        first_byte
+                    ))),
+                }
             }
-            3 => { // Special encoding - integer as string
+            3 => { // Special encoding - integer as string or compressed data
                 let encoding = first_byte & 0x3F;
                 let value = match encoding {
                     0 => { // 8 bit integer
@@ -286,6 +435,17 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                     2 => { // 32 bit integer
                         let v = self.read_u32().await?;
                         format!("{}", v as i32)
+                    }
+                    3 => { // LZF compressed string - 读取压缩长度和原始长度，然后跳过压缩数据
+                        let compressed_len = self.read_length().await?;
+                        let original_len = self.read_length().await?;
+                        // 跳过压缩数据
+                        let mut compressed_data = vec![0u8; compressed_len];
+                        self.reader.read_exact(&mut compressed_data).await?;
+                        tracing::debug!("遇到 LZF 压缩字符串，跳过解压保留原始字节 (compressed_len={}, original_len={})", 
+                            compressed_len, original_len);
+                        // 返回空字符串作为占位
+                        String::new()
                     }
                     _ => return Err(SyncError::Corrupted(format!("未知的特殊编码类型: {}", encoding))),
                 };
@@ -348,52 +508,62 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
     /// 读取值
     ///
     /// 根据 RDB 类型读取对应的值。
-    /// 同时返回原始 RDB 编码数据（用于 DUMP 格式）。
+    /// 同时返回原始 RDB 编码数据（用于 RESTORE/DUMP 格式）。
     ///
-    /// 重要：对于 String 类型，我们需要捕获原始字节（包括长度编码），
-    /// 而不是解码后重新编码，因为原始数据可能使用了特殊的整数编码。
+    /// 设计原则：不深入解析 value 内部结构，
+    /// 而是按类型提取出 value 的原始二进制块，
+    /// 因为数据会通过 RESTORE 命令原样回放。
     async fn read_value(&mut self, rdb_type: RdbType) -> Result<(Bytes, Bytes)> {
         match rdb_type {
             RdbType::String => {
-                // 读取字符串的原始字节（包括长度编码）
                 let (value, raw_bytes) = self.read_string_with_raw_bytes().await?;
-
-                // raw_value 不包含类型字节，只包含长度编码和数据
-                // DUMP 格式: [version][length_encoded_data][crc64]
                 Ok((value, raw_bytes))
             }
 
-            // 其他类型的简化实现
-            _ => {
-                // 对于非 String 类型，捕获原始字节
-                // 注意：不包含类型字节，因为 DUMP 格式不需要
-                let mut raw_data = BytesMut::new();
+            // ===== 压缩类型：value 是单个字符串 (可能 LZF 压缩) =====
+            RdbType::HashZipmap
+            | RdbType::ListZiplist
+            | RdbType::SetIntset
+            | RdbType::SortedSetZiplist
+            | RdbType::HashZiplist
+            | RdbType::HashListpack
+            | RdbType::SortedSetListpack
+            | RdbType::SetListpack => {
+                let (value, raw_bytes) = self.read_string_with_raw_bytes().await?;
+                Ok((value, raw_bytes))
+            }
 
-                // 读取长度和数据
-                match self.read_length().await {
-                    Ok(length) if length > 0 && length < 100_000_000 => {
-                        // 添加长度编码
-                        self.encode_length_to_buf(length, &mut raw_data);
+            // ===== 旧格式 List / Set：[len] + N × [string] =====
+            RdbType::List | RdbType::Set => {
+                self.read_list_set_raw_value().await
+            }
 
-                        // 读取数据
-                        let mut buffer = vec![0u8; length];
-                        if let Err(e) = self.reader.read_exact(&mut buffer).await {
-                            tracing::warn!("读取 RDB value 失败: {}, 类型: {:?}", e, rdb_type);
-                            return Ok((Bytes::new(), Bytes::new()));
-                        }
-                        raw_data.extend_from_slice(&buffer);
+            // ===== 旧格式 Hash：[len] + N × ([field_string][value_string]) =====
+            RdbType::Hash => {
+                self.read_hash_raw_value().await
+            }
 
-                        Ok((Bytes::from(buffer), raw_data.freeze()))
-                    }
-                    Ok(_) => {
-                        // 长度无效，返回空
-                        Ok((Bytes::new(), Bytes::new()))
-                    }
-                    Err(e) => {
-                        tracing::warn!("读取 RDB value 长度失败: {}, 类型: {:?}", e, rdb_type);
-                        Ok((Bytes::new(), Bytes::new()))
-                    }
-                }
+            // ===== 旧格式 ZSet：[len] + N × ([member_string][score_double_8B_LE]) =====
+            RdbType::SortedSet | RdbType::SortedSet2 => {
+                self.read_zset_raw_value().await
+            }
+
+            // ===== Quicklist：[len] + N × [ziplist/listpack_string] =====
+            RdbType::Quicklist | RdbType::Quicklist2 => {
+                self.read_quicklist_raw_value().await
+            }
+
+            // Module 类型：跳过
+            RdbType::Module | RdbType::Module2 => {
+                let _module_id = self.read_u64().await?;
+                let _module_data = self.read_string().await?;
+                tracing::debug!("跳过 Module 数据: type={:?}, module_id={}", rdb_type, _module_id);
+                Ok((Bytes::new(), Bytes::new()))
+            }
+
+            // Stream 类型：已有专门处理
+            RdbType::StreamListpacks | RdbType::StreamListpacks2 | RdbType::StreamListpacks3 => {
+                self.read_stream_value(rdb_type).await
             }
         }
     }
@@ -425,16 +595,33 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                 raw_bytes.extend_from_slice(&data);
                 Ok((data, raw_bytes.freeze()))
             }
-            2 => { // 32 bit length
-                let len = self.read_u32().await? as usize;
-                let data = self.read_string_raw(len).await?;
-                let mut raw_bytes = BytesMut::new();
-                raw_bytes.extend_from_slice(&[first_byte]);
-                raw_bytes.extend_from_slice(&(len as u32).to_le_bytes());
-                raw_bytes.extend_from_slice(&data);
-                Ok((data, raw_bytes.freeze()))
+            2 => { // 32 bit 或 64 bit 长度 (big endian)
+                match first_byte {
+                    0x80 => { // rdb32bitLen: 32 bit length (big endian)
+                        let len = self.read_u32_be().await? as usize;
+                        let data = self.read_string_raw(len).await?;
+                        let mut raw_bytes = BytesMut::new();
+                        raw_bytes.extend_from_slice(&[first_byte]);
+                        raw_bytes.extend_from_slice(&(len as u32).to_be_bytes());
+                        raw_bytes.extend_from_slice(&data);
+                        Ok((data, raw_bytes.freeze()))
+                    }
+                    0x81 => { // rdb64bitLen: 64 bit length (big endian)
+                        let len = self.read_u64_be().await? as usize;
+                        let data = self.read_string_raw(len).await?;
+                        let mut raw_bytes = BytesMut::new();
+                        raw_bytes.extend_from_slice(&[first_byte]);
+                        raw_bytes.extend_from_slice(&(len as u64).to_be_bytes());
+                        raw_bytes.extend_from_slice(&data);
+                        Ok((data, raw_bytes.freeze()))
+                    }
+                    _ => Err(SyncError::Corrupted(format!(
+                        "read_string_with_raw_bytes: 非法的长度编码字节: {:#x}",
+                        first_byte
+                    ))),
+                }
             }
-            3 => { // Special encoding - integer as string
+            3 => { // Special encoding - integer as string or compressed data
                 let encoding = first_byte & 0x3F;
                 let (value, raw_bytes) = match encoding {
                     0 => { // 8 bit integer
@@ -460,12 +647,139 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                         raw.extend_from_slice(&v.to_le_bytes());
                         (value, raw.freeze())
                     }
+                    3 => { // LZF compressed string
+                        let compressed_len = self.read_length().await?;
+                        let original_len = self.read_length().await?;
+                        let mut compressed_data = vec![0u8; compressed_len];
+                        self.reader.read_exact(&mut compressed_data).await?;
+                        // tracing::debug!("遇到 LZF 压缩字符串，跳过解压保留原始字节 (compressed_len={}, original_len={})", 
+                        //     compressed_len, original_len);
+                        // 返回空值和原始字节（包含压缩数据）
+                        let mut raw = BytesMut::new();
+                        raw.extend_from_slice(&[first_byte]);
+                        self.encode_length_to_buf(compressed_len, &mut raw);
+                        self.encode_length_to_buf(original_len, &mut raw);
+                        raw.extend_from_slice(&compressed_data);
+                        (Bytes::new(), raw.freeze())
+                    }
                     _ => return Err(SyncError::Corrupted(format!("未知的特殊编码类型: {}", encoding))),
                 };
                 Ok((value, raw_bytes))
             }
             _ => unreachable!(),
         }
+    }
+
+    // ============================================================
+    // 按类型提取 value 原始字节的方法
+    //
+    // 这些方法不深入解析 value 内部结构，
+    // 而是将 type_byte 之后的完整原始二进制块提取出来，
+    // 用于构建 RESTORE 命令的 serialized-value。
+    // ============================================================
+
+    /// 读取旧格式 List / Set 的原始字节
+    ///
+    /// RDB 格式: [len(元素数)] [string_1] [string_2] ...
+    async fn read_list_set_raw_value(&mut self) -> Result<(Bytes, Bytes)> {
+        let (count, len_raw) = self.read_length_with_raw().await?;
+
+        // 安全上限：防止损坏数据导致 OOM
+        if count > 100_000_000 {
+            return Err(SyncError::Corrupted(format!(
+                "List/Set 元素数量异常: {}",
+                count
+            )));
+        }
+
+        let mut raw = BytesMut::new();
+        raw.extend_from_slice(&len_raw);
+
+        for _ in 0..count {
+            let (_elem_value, elem_raw) = self.read_string_with_raw_bytes().await?;
+            raw.extend_from_slice(&elem_raw);
+        }
+
+        Ok((Bytes::new(), raw.freeze()))
+    }
+
+    /// 读取旧格式 Hash 的原始字节
+    ///
+    /// RDB 格式: [len(元素数)] [field_1][value_1] [field_2][value_2] ...
+    async fn read_hash_raw_value(&mut self) -> Result<(Bytes, Bytes)> {
+        let (count, len_raw) = self.read_length_with_raw().await?;
+
+        if count > 100_000_000 {
+            return Err(SyncError::Corrupted(format!(
+                "Hash 元素数量异常: {}",
+                count
+            )));
+        }
+
+        let mut raw = BytesMut::new();
+        raw.extend_from_slice(&len_raw);
+
+        for _ in 0..count {
+            let (_field, field_raw) = self.read_string_with_raw_bytes().await?;
+            raw.extend_from_slice(&field_raw);
+            let (_value, value_raw) = self.read_string_with_raw_bytes().await?;
+            raw.extend_from_slice(&value_raw);
+        }
+
+        Ok((Bytes::new(), raw.freeze()))
+    }
+
+    /// 读取旧格式 ZSet / ZSet2 的原始字节
+    ///
+    /// RDB 格式: [len(元素数)] [member_1][score_1(8B LE double)] [member_2][score_2] ...
+    async fn read_zset_raw_value(&mut self) -> Result<(Bytes, Bytes)> {
+        let (count, len_raw) = self.read_length_with_raw().await?;
+
+        if count > 100_000_000 {
+            return Err(SyncError::Corrupted(format!(
+                "ZSet 元素数量异常: {}",
+                count
+            )));
+        }
+
+        let mut raw = BytesMut::new();
+        raw.extend_from_slice(&len_raw);
+
+        for _ in 0..count {
+            let (_member, member_raw) = self.read_string_with_raw_bytes().await?;
+            raw.extend_from_slice(&member_raw);
+
+            // score: 8 字节 little-endian double
+            let mut score_buf = [0u8; 8];
+            self.reader.read_exact(&mut score_buf).await?;
+            raw.extend_from_slice(&score_buf);
+        }
+
+        Ok((Bytes::new(), raw.freeze()))
+    }
+
+    /// 读取 Quicklist / Quicklist2 的原始字节
+    ///
+    /// RDB 格式: [len(节点数)] [ziplist/listpack_string_1] [ziplist/listpack_string_2] ...
+    async fn read_quicklist_raw_value(&mut self) -> Result<(Bytes, Bytes)> {
+        let (count, len_raw) = self.read_length_with_raw().await?;
+
+        if count > 100_000_000 {
+            return Err(SyncError::Corrupted(format!(
+                "Quicklist 节点数量异常: {}",
+                count
+            )));
+        }
+
+        let mut raw = BytesMut::new();
+        raw.extend_from_slice(&len_raw);
+
+        for _ in 0..count {
+            let (_node, node_raw) = self.read_string_with_raw_bytes().await?;
+            raw.extend_from_slice(&node_raw);
+        }
+
+        Ok((Bytes::new(), raw.freeze()))
     }
 
     /// 将字符串编码为 RDB 格式
@@ -486,6 +800,11 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
     }
 
     /// 将长度编码写入缓冲区
+    ///
+    /// 参考 Redis rdb.c rdbSaveLen：
+    /// - < 64: 1 byte (6 bit length)
+    /// - < 16384: 2 bytes (14 bit length, big endian)
+    /// - >= 16384: 5 bytes (0x80 + 4 bytes big endian)
     fn encode_length_to_buf(&self, length: usize, buf: &mut BytesMut) {
         if length < 64 {
             // 6 bit length
@@ -497,22 +816,307 @@ impl<R: AsyncRead + Unpin> RdbParser<R> {
                 (length & 0xFF) as u8,
             ]);
         } else {
-            // 32 bit length
+            // 32 bit length (big endian)
             buf.extend_from_slice(&[0x80]);
-            buf.extend_from_slice(&(length as u32).to_le_bytes());
+            buf.extend_from_slice(&(length as u32).to_be_bytes());
         }
     }
     
-    /// 读取 u32
+    /// 读取 u32 (little endian)
     async fn read_u32(&mut self) -> Result<u32> {
         let value = self.reader.read_u32_le().await?;
         Ok(value)
     }
-    
-    /// 读取 u64
+
+    /// 读取 u32 (big endian) - 用于 RDB 长度编码
+    async fn read_u32_be(&mut self) -> Result<u32> {
+        let value = self.reader.read_u32().await?;
+        Ok(value)
+    }
+
+    /// 读取 u64 (little endian)
     async fn read_u64(&mut self) -> Result<u64> {
         let value = self.reader.read_u64_le().await?;
         Ok(value)
+    }
+
+    /// 读取 u64 (big endian) - 用于 RDB 长度编码
+    async fn read_u64_be(&mut self) -> Result<u64> {
+        let value = self.reader.read_u64().await?;
+        Ok(value)
+    }
+
+    /// 跳过 Module 数据
+    ///
+    /// Module 数据结构（参考 Redis rdb.c rdbLoadCheckModuleValue）：
+    /// - opcode (length encoded)
+    /// - 如果 opcode == 0 (EOF)，停止
+    /// - 如果 opcode == 1 (SINT) 或 2 (UINT)，读取另一个 length（值）
+    /// - 如果 opcode == 3 (FLOAT)，读取 4 字节
+    /// - 如果 opcode == 4 (DOUBLE)，读取 8 字节
+    /// - 如果 opcode == 5 (STRING)，读取字符串
+    /// - 重复
+    async fn skip_module_value(&mut self) -> Result<()> {
+        loop {
+            let opcode = match self.read_length().await {
+                Ok(op) => op,
+                Err(e) => {
+                    tracing::warn!("读取 module opcode 失败: {}", e);
+                    return Err(e);
+                }
+            };
+
+            if opcode == 0 {
+                // EOF
+                break;
+            }
+
+            match opcode {
+                1 | 2 => {
+                    // SINT or UINT
+                    if let Err(e) = self.read_length().await {
+                        tracing::warn!("读取 module SINT/UINT 值失败: {}", e);
+                        return Err(e);
+                    }
+                }
+                3 => {
+                    // FLOAT (4 bytes)
+                    let mut buf = [0u8; 4];
+                    if let Err(e) = self.reader.read_exact(&mut buf).await {
+                        tracing::warn!("读取 module FLOAT 值失败: {}", e);
+                        return Err(SyncError::Io(e));
+                    }
+                }
+                4 => {
+                    // DOUBLE (8 bytes)
+                    let mut buf = [0u8; 8];
+                    if let Err(e) = self.reader.read_exact(&mut buf).await {
+                        tracing::warn!("读取 module DOUBLE 值失败: {}", e);
+                        return Err(SyncError::Io(e));
+                    }
+                }
+                5 => {
+                    // STRING
+                    if let Err(e) = self.read_string().await {
+                        tracing::warn!("读取 module STRING 值失败: {}", e);
+                        return Err(e);
+                    }
+                }
+                _ => {
+                    tracing::warn!("未知的 module opcode: {}", opcode);
+                    return Err(SyncError::Corrupted(format!("未知的 module opcode: {}", opcode)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 读取 Stream 类型的值
+    ///
+    /// Stream 类型（StreamListpacks、StreamListpacks2 和 StreamListpacks3）的结构比较复杂：
+    /// 参考 Redis 源码 rdb.c 中的 rdbSaveStream 和 rdbLoadStream 函数
+    ///
+    /// 由于 Stream 结构复杂且版本间有差异，这里采用更保守的策略：
+    /// 读取并验证已知字段，遇到错误时优雅地跳过剩余数据
+    async fn read_stream_value(&mut self, rdb_type: RdbType) -> Result<(Bytes, Bytes)> {
+        // 读取 listpack 数量
+        let listpack_count = match self.read_length_with_encoding().await {
+            Ok((len, _, _)) => len,
+            Err(e) => {
+                tracing::warn!("读取 Stream listpack 数量失败: {}, 类型: {:?}", e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+        };
+
+        // 跳过所有 listpack
+        // 参考 Go 代码：每个 listpack 是一个 raw string (16 byte key + listpack data)
+        for i in 0..listpack_count {
+            // 读取 listpack 的 stream ID (16 bytes raw string)
+            // 参考 Go 代码: key := r.ReadStringP()，然后检查 len(key) == 16
+            let stream_id = match self.read_string().await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!("读取 Stream listpack {} stream ID 失败: {}, 类型: {:?}", i, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+            };
+
+            if stream_id.len() != 16 {
+                tracing::warn!("Stream listpack {} stream ID 长度不是 16 字节: {}, 类型: {:?}", i, stream_id.len(), rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+
+            // 读取 listpack 数据 (raw string)
+            if let Err(e) = self.read_string().await {
+                tracing::warn!("读取 Stream listpack {} 数据失败: {}, 类型: {:?}", i, e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+        }
+
+        // 读取 Stream ID (last_id: ms + seq)
+        if let Err(e) = self.read_length_with_encoding().await {
+            tracing::warn!("读取 Stream last_id_ms 失败: {}, 类型: {:?}", e, rdb_type);
+            return Ok((Bytes::new(), Bytes::new()));
+        }
+        if let Err(e) = self.read_length_with_encoding().await {
+            tracing::warn!("读取 Stream last_id_seq 失败: {}, 类型: {:?}", e, rdb_type);
+            return Ok((Bytes::new(), Bytes::new()));
+        }
+
+        // StreamListpacks2 和 StreamListpacks3 有额外的元数据
+        if rdb_type == RdbType::StreamListpacks2 || rdb_type == RdbType::StreamListpacks3 {
+            // first_id (ms, seq)
+            if let Err(e) = self.read_length_with_encoding().await {
+                tracing::warn!("读取 Stream first_id_ms 失败: {}, 类型: {:?}", e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+            if let Err(e) = self.read_length_with_encoding().await {
+                tracing::warn!("读取 Stream first_id_seq 失败: {}, 类型: {:?}", e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+
+            // max_deleted_entry_id (ms, seq)
+            if let Err(e) = self.read_length_with_encoding().await {
+                tracing::warn!("读取 Stream max_deleted_ms 失败: {}, 类型: {:?}", e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+            if let Err(e) = self.read_length_with_encoding().await {
+                tracing::warn!("读取 Stream max_deleted_seq 失败: {}, 类型: {:?}", e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+
+            // entries_added
+            if let Err(e) = self.read_length_with_encoding().await {
+                tracing::warn!("读取 Stream entries_added 失败: {}, 类型: {:?}", e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+        }
+
+        // 读取消费组数量
+        let cgroups_count = match self.read_length_with_encoding().await {
+            Ok((len, _, _)) => len,
+            Err(e) => {
+                tracing::warn!("读取 Stream 消费组数量失败: {}, 类型: {:?}", e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+        };
+
+        // 跳过消费组数据
+        for cg_idx in 0..cgroups_count {
+            // 消费组名称（字符串）
+            if let Err(e) = self.read_string().await {
+                tracing::warn!("读取 Stream 消费组 {} 名称失败: {}, 类型: {:?}", cg_idx, e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+
+            // 消费组 last_id (ms, seq)
+            if let Err(e) = self.read_length_with_encoding().await {
+                tracing::warn!("读取 Stream 消费组 {} last_id_ms 失败: {}, 类型: {:?}", cg_idx, e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+            if let Err(e) = self.read_length_with_encoding().await {
+                tracing::warn!("读取 Stream 消费组 {} last_id_seq 失败: {}, 类型: {:?}", cg_idx, e, rdb_type);
+                return Ok((Bytes::new(), Bytes::new()));
+            }
+
+            // entries_read（仅 StreamListpacks2 和 StreamListpacks3）
+            if rdb_type == RdbType::StreamListpacks2 || rdb_type == RdbType::StreamListpacks3 {
+                if let Err(e) = self.read_length_with_encoding().await {
+                    tracing::warn!("读取 Stream 消费组 {} entries_read 失败: {}, 类型: {:?}", cg_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+            }
+
+            // 读取全局 PEL 数量
+            let global_pel_count = match self.read_length_with_encoding().await {
+                Ok((len, _, _)) => len,
+                Err(e) => {
+                    tracing::warn!("读取 Stream 消费组 {} 全局 PEL 数量失败: {}, 类型: {:?}", cg_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+            };
+
+            // 跳过全局 PEL 条目
+            // 参考 Go 代码：每个 PEL 条目是 16 bytes stream ID + 8 bytes delivery time + length encoded delivery count
+            for pel_idx in 0..global_pel_count {
+                // stream ID (16 bytes)
+                let mut stream_id_buf = [0u8; 16];
+                if let Err(e) = self.reader.read_exact(&mut stream_id_buf).await {
+                    tracing::warn!("读取 Stream 全局 PEL 条目 {} stream ID 失败: {}, 类型: {:?}", pel_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+
+                // delivery_time (8 bytes)
+                if let Err(e) = self.read_u64().await {
+                    tracing::warn!("读取 Stream 全局 PEL 条目 {} delivery_time 失败: {}, 类型: {:?}", pel_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+
+                // delivery_count (length encoded)
+                if let Err(e) = self.read_length_with_encoding().await {
+                    tracing::warn!("读取 Stream 全局 PEL 条目 {} delivery_count 失败: {}, 类型: {:?}", pel_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+            }
+
+            // 读取消费者数量
+            let consumers_count = match self.read_length_with_encoding().await {
+                Ok((len, _, _)) => len,
+                Err(e) => {
+                    tracing::warn!("读取 Stream 消费组 {} 消费者数量失败: {}, 类型: {:?}", cg_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+            };
+
+            // 跳过消费者数据
+            for cons_idx in 0..consumers_count {
+                // 消费者名称（字符串）
+                if let Err(e) = self.read_string().await {
+                    tracing::warn!("读取 Stream 消费者 {} 名称失败: {}, 类型: {:?}", cons_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+
+                // 消费者 seen_time（8 bytes）
+                if let Err(e) = self.read_u64().await {
+                    tracing::warn!("读取 Stream 消费者 {} seen_time 失败: {}, 类型: {:?}", cons_idx, e, rdb_type);
+                    return Ok((Bytes::new(), Bytes::new()));
+                }
+
+                // active_time（仅 StreamListpacks2 和 StreamListpacks3）
+                if rdb_type == RdbType::StreamListpacks2 || rdb_type == RdbType::StreamListpacks3 {
+                    if let Err(e) = self.read_u64().await {
+                        tracing::warn!("读取 Stream 消费者 {} active_time 失败: {}, 类型: {:?}", cons_idx, e, rdb_type);
+                        return Ok((Bytes::new(), Bytes::new()));
+                    }
+                }
+
+                // 读取消费者 PEL 数量
+                let pel_count = match self.read_length_with_encoding().await {
+                    Ok((len, _, _)) => len,
+                    Err(e) => {
+                        tracing::warn!("读取 Stream 消费者 {} PEL 数量失败: {}, 类型: {:?}", cons_idx, e, rdb_type);
+                        return Ok((Bytes::new(), Bytes::new()));
+                    }
+                };
+
+                // 跳过消费者 PEL 条目
+                // 参考 Go 代码：每个 PEL 条目只有 16 bytes stream ID
+                for pel_idx in 0..pel_count {
+                    // stream ID (16 bytes)
+                    let mut stream_id_buf = [0u8; 16];
+                    if let Err(e) = self.reader.read_exact(&mut stream_id_buf).await {
+                        tracing::warn!("读取 Stream 消费者 PEL 条目 {} stream ID 失败: {}, 类型: {:?}", pel_idx, e, rdb_type);
+                        return Ok((Bytes::new(), Bytes::new()));
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("跳过 Stream 数据: type={:?}", rdb_type);
+
+        // 返回空值，表示跳过此条目
+        // 注意：由于 Stream 结构复杂，我们不尝试重建原始字节
+        Ok((Bytes::new(), Bytes::new()))
     }
 }
 
