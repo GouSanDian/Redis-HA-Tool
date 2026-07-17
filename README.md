@@ -245,3 +245,18 @@ Redis Cluster / Sentinel 备用集群（双活互写/灾备兜底）
 
 - **企业级数据运维**：定时备份、误删恢复、断点稳定同步，保障数据安全
 
+# 🤝欢迎 Star、使用我们团队的其它产品
+
+大模型呼叫中心系统：https://github.com/lihaiya/freeipcc
+
+大模型人力资源系统：https://github.com/FreeAiHR/FreeAiHR
+
+Redis集群双活架构工具：https://github.com/GouSanDian/Redis-HA-Tool
+
+企业私有化部署的软件管家：https://github.com/GouSanDian/AppHub
+
+自然语言对话数据库（目前在设计阶段）：https://github.com/GouSanDian/Talk-To-DB
+
+大模型沙盘系统（目前在设计阶段）：https://github.com/AiSandTable/AiSandTable
+
+大模型智能运维系统（持续迭代中）：https://github.com/lihaiya/FreeAiOps
