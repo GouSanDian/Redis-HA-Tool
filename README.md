@@ -260,3 +260,14 @@ Redis集群双活架构工具：https://github.com/GouSanDian/Redis-HA-Tool
 大模型沙盘系统（目前在设计阶段）：https://github.com/AiSandTable/AiSandTable
 
 大模型智能运维系统（持续迭代中）：https://github.com/lihaiya/FreeAiOps
+
+# 联系我们
+
+## 微信群
+
+<img width="103.1" height="147.8" alt="24a169629bcfead1e3f545e75b8d0e58" src="https://github.com/user-attachments/assets/9f0d4305-6ebe-4b04-ae6a-6e7e7f57a016" />
+
+## 客服微信
+
+<img width="95.0" height="129.5" alt="b6add25034c22a813d7b45b17c95762a" src="https://github.com/user-attachments/assets/2ab6f854-d044-4989-98b9-ed51ac6d1aad" />
+
